@@ -1,10 +1,9 @@
-flask==2.3.3
+flask==3.0.0
 flask-cors==4.0.0
-torch==2.5.1
-torchvision==0.20.1
-timm==1.0.12
-pillow==11.0.0
-groq==0.3.0
+torch==2.1.0
+torchvision==0.16.0
+timm==0.9.12
+pillow==10.1.0
+groq==0.4.1
 python-dotenv==1.0.0
-gunicorn==23.0.0
-huggingface-hub==0.26.5
+gunicorn==21.2.0
