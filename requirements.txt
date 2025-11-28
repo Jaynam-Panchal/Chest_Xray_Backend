@@ -1,4 +1,4 @@
-flask==3.0.0
+flask==2.3.4
 flask-cors==4.0.0
 # PyTorch - Using stable version compatible with Python 3.11
 # For CPU-only (recommended for Render to avoid large builds)
