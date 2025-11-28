@@ -11,33 +11,92 @@ import os
 import re
 from groq import Client
 from dotenv import load_dotenv
+from huggingface_hub import hf_hub_download
+import shutil
 load_dotenv()
 
 PORT = int(os.environ.get('PORT', 5000))
+HUGGINGFACE_REPO = os.getenv('HUGGINGFACE_REPO', 'jainam1510/Chest_Xray_model')
+HUGGINGFACE_TOKEN = os.getenv('HUGGINGFACE_TOKEN')
+
+if HUGGINGFACE_TOKEN is None:
+    print('HUGGINGFACE_TOKEN not set - public repo access only or set token for private repo')
+
+
+def download_model_from_hf(filename):
+    """Download a file from the Hugging Face repo into local `best_models/` if missing.
+    Returns the local path to the downloaded file (inside `best_models/`) or the cached path.
+    """
+    repo_id = HUGGINGFACE_REPO
+    token = HUGGINGFACE_TOKEN
+    candidates = [filename, os.path.join('best_models', filename)]
+    last_err = None
+    for candidate in candidates:
+        try:
+            print(f"Attempting to download '{candidate}' from HF repo '{repo_id}'")
+            cached_file = hf_hub_download(repo_id=repo_id, filename=candidate, token=token)
+            print(f"Downloaded model to cache: {cached_file}")
+
+            # Ensure local best_models folder exists
+            os.makedirs('best_models', exist_ok=True)
+            target_path = os.path.join('best_models', os.path.basename(filename))
+
+            try:
+                shutil.copy(cached_file, target_path)
+                print(f"Copied model to local path: {target_path}")
+                return target_path
+            except Exception as e:
+                print(f"Failed to copy cached model to {target_path}: {e}")
+                return cached_file
+        except Exception as e:
+            print(f"Could not download '{candidate}': {e}")
+            last_err = e
+    raise FileNotFoundError(f"Could not find '{filename}' in HF repo '{repo_id}': {last_err}")
+
+
+def predownload_all_models():
+    """Attempt to download all models listed in MODEL_PATHS into `best_models/`.
+    This runs at startup on Render to ensure files are in the container filesystem.
+    """
+    os.makedirs('best_models', exist_ok=True)
+    for name, path in MODEL_PATHS.items():
+        if not os.path.exists(path):
+            try:
+                print(f"Prefetching model '{name}' -> '{path}'")
+                downloaded = download_model_from_hf(path)
+                print(f"Model '{name}' available at: {downloaded}")
+            except Exception as e:
+                print(f"Warning: failed to prefetch model '{name}': {e}")
 
 app = Flask(__name__)
 
-# CORS configuration 
+# CORS configuration - Update with your frontend URL after deployment
 ALLOWED_ORIGINS = [
-    "http://localhost:3000",  # Local development
-    "http://localhost:5173",  # Vite dev server
-    "https://Chest_Xray.vercel.app"  # Update this after deploying frontend
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "https://chest-xray.vercel.app",  # Update this
+    os.environ.get('FRONTEND_URL', '')  # Add from env variable
 ]
+
+# Filter out empty strings
+ALLOWED_ORIGINS = [origin for origin in ALLOWED_ORIGINS if origin]
 
 CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
 
-# Request counter for better variation
+# Request counter for variation
 request_counter = 0
 
-# ============ CONFIGURATION - MODIFY THIS SECTION ============
-# Define all model paths
+# ============ CONFIGURATION ============
 MODEL_PATHS = {
-    "VGG19": "best_models/OVERALL_BEST_VGG19_lr0.005_weight_decay0.0001_batch_size32_optimizersgd.pth",
-    "ResNet18": "best_models/BEST_ResNet18_lr0.01_weight_decay0.0001_batch_size32_optimizersgd.pth",
-    "ViT_Small": "best_models/BEST_ViT_Small_lr0.0001_weight_decay0.05_batch_size32_optimizeradamw.pth"
+    "VGG19": "OVERALL_BEST_VGG19_lr0.005_weight_decay0.0001_batch_size32_optimizersgd.pth",
+    "ResNet18": "BEST_ResNet18_lr0.01_weight_decay0.0001_batch_size32_optimizersgd.pth",
+    "ViT_Small": "BEST_ViT_Small_lr0.0001_weight_decay0.05_batch_size32_optimizeradamw.pth"
 }
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    print("WARNING: GROQ_API_KEY not found in environment variables!")
+
 # =============================================================
 
 NUM_CLASSES = 4
@@ -47,9 +106,14 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TEMPERATURE = 5.0
 
 print(f"Using device: {DEVICE}")
+print(f"Python version: {os.sys.version}")
+print(f"PyTorch version: {torch.__version__}")
 
 # Initialize Groq client
-groq_client = Client(api_key=GROQ_API_KEY)
+if GROQ_API_KEY:
+    groq_client = Client(api_key=GROQ_API_KEY)
+else:
+    groq_client = None
 
 # Store loaded models in memory
 loaded_models = {}
@@ -67,16 +131,19 @@ transform = transforms.Compose([
 # =============================================================
 
 def get_resnet18(num_classes):
+    """Build ResNet18 model"""
     model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
 
 def get_vgg19(num_classes):
+    """Build VGG19 model"""
     model = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1)
     model.classifier[6] = nn.Linear(model.classifier[6].in_features, num_classes)
     return model
 
 def get_vit_small(num_classes):
+    """Build Vision Transformer Small model"""
     model = timm.create_model('vit_small_patch16_224', pretrained=True)
     model.head = nn.Linear(model.head.in_features, num_classes)
     return model
@@ -86,110 +153,61 @@ def get_vit_small(num_classes):
 # =============================================================
 
 def generate_medical_report(predicted_class, confidence, all_probabilities, request_id=0):
+    """Generate medical report using Groq API"""
+    if not groq_client:
+        print("Groq client not initialized, using fallback reports")
+        confidence_tier = get_confidence_tier(confidence)
+        return {
+            'clinical_interpretation': get_fallback_clinical(predicted_class, confidence),
+            'recommendations': get_fallback_recommendations(predicted_class, confidence_tier)
+        }
+    
     try:
         import random
+        import hashlib
         
         probs_text = ", ".join([f"{name}: {prob*100:.1f}%" for name, prob in sorted(all_probabilities.items(), key=lambda x: x[1], reverse=True)])
         
-        # ===== Confidence Tier System =====
-        if confidence >= 0.90:
-            confidence_tier = "very_high"
+        # Confidence Tier System
+        confidence_tier = get_confidence_tier(confidence)
+        
+        if confidence_tier == "very_high":
             confidence_descriptor = "high confidence, clear and definitive findings"
             severity_guidance = "findings are very clear and unmistakable"
             num_findings = 4
             num_recommendations = 6
-        elif confidence >= 0.75:
-            confidence_tier = "high"
+        elif confidence_tier == "high":
             confidence_descriptor = "good confidence, typical findings observed"
             severity_guidance = "findings are evident and consistent with diagnosis"
             num_findings = 4
             num_recommendations = 5
-        elif confidence >= 0.60:
-            confidence_tier = "moderate"
+        elif confidence_tier == "moderate":
             confidence_descriptor = "moderate confidence, suggestive findings"
             severity_guidance = "findings suggest diagnosis but further correlation advised"
             num_findings = 4
             num_recommendations = 5
         else:
-            confidence_tier = "low"
             confidence_descriptor = "lower confidence, subtle findings"
             severity_guidance = "findings are subtle, clinical correlation strongly recommended"
             num_findings = 3
             num_recommendations = 4
         
-        import hashlib
+        # Generate variation seed
         confidence_bucket = f"{confidence:.4f}"
         variation_string = f"{predicted_class}_{confidence_bucket}_{request_id}_{int(time.time() * 1000) % 10000}"
         variation_seed = int(hashlib.md5(variation_string.encode()).hexdigest()[:8], 16) % 10000
         random.seed(variation_seed)
         
-        # Detailed, label-specific medical context
-        class_context = {
-            'COVID': {
-                'radiographic_findings': 'bilateral ground-glass opacities, peripheral distribution, typical COVID-19 pneumonia pattern',
-                'clinical_significance': 'viral infection affecting both lungs, respiratory system involvement, contagious disease',
-                'patient_explanation': 'cloudy patches in both lungs showing viral infection pattern typical of COVID-19',
-                'actions_very_high': 'Immediate RT-PCR/COVID test required, strict home isolation mandatory, continuous oxygen monitoring, antiviral therapy initiation, public health notification',
-                'actions_high': 'RT-PCR/COVID test recommended, home isolation advised, regular oxygen monitoring, consider antiviral therapy, standard follow-up',
-                'actions_moderate': 'Consider RT-PCR testing, home precautions suggested, monitor symptoms, clinical correlation needed, conservative management',
-                'actions_low': 'Clinical correlation essential, consider testing if symptoms worsen, observe closely, repeat imaging recommended, differential diagnosis needed',
-                'monitoring': 'oxygen saturation, breathing difficulty, fever progression',
-                'follow_up': 'chest X-ray in 5-7 days, telehealth check-ins, emergency if breathing worsens'
-            },
-            'Viral Pneumonia': {
-                'radiographic_findings': 'bilateral interstitial infiltrates, diffuse pulmonary involvement, viral pneumonia pattern',
-                'clinical_significance': 'non-COVID viral lung infection, inflammatory response in airways, respiratory compromise',
-                'patient_explanation': 'widespread inflammation in both lungs caused by a viral infection (not COVID-19)',
-                'actions_very_high': 'Comprehensive viral panel testing urgent, respiratory isolation mandatory, oxygen therapy if needed, broad antiviral coverage, intensive monitoring',
-                'actions_high': 'Viral panel testing recommended, respiratory precautions advised, supportive care, symptom management, regular monitoring',
-                'actions_moderate': 'Consider viral testing, supportive measures, rest and hydration, monitor progression, clinical correlation',
-                'actions_low': 'Clinical assessment needed, observe symptoms, consider testing if worsening, supportive care, differential workup',
-                'monitoring': 'temperature, breathing pattern, energy levels, cough progression',
-                'follow_up': 'follow-up imaging in 10 days, symptom diary, gradual activity increase'
-            },
-            'Lung_Opacity': {
-                'radiographic_findings': 'pulmonary opacity present, localized or diffuse density, etiology unclear',
-                'clinical_significance': 'abnormal area in lung tissue, requires further investigation, could indicate infection or inflammation',
-                'patient_explanation': 'unclear cloudy area in the lungs that needs more tests to understand the cause',
-                'actions_very_high': 'Urgent CT scan required, comprehensive blood work, immediate pulmonology consult, rule out serious pathology, expedited workup',
-                'actions_high': 'CT scan recommended for characterization, blood work advised, pulmonology referral, thorough investigation needed',
-                'actions_moderate': 'Consider CT for detail, basic labs, clinical correlation, monitor progression, conservative approach',
-                'actions_low': 'Observe closely, consider repeat imaging, clinical assessment, may be benign finding, watchful waiting',
-                'monitoring': 'new symptoms, breathing changes, chest discomfort, cough development',
-                'follow_up': 'repeat chest X-ray in 2-4 weeks, track symptoms daily, specialist referral if needed'
-            },
-            'Normal': {
-                'radiographic_findings': 'clear bilateral lung fields, normal cardiopulmonary silhouette, no acute abnormalities',
-                'clinical_significance': 'no evidence of infection, inflammation, or structural abnormality, healthy lung appearance',
-                'patient_explanation': 'lungs appear healthy and clear with no signs of infection or disease',
-                'actions_very_high': 'No intervention required, routine health maintenance, continue normal activities, annual check-ups',
-                'actions_high': 'No immediate treatment needed, routine preventive care, standard follow-up schedule',
-                'actions_moderate': 'Likely no intervention needed, observe if symptoms present, routine care advised',
-                'actions_low': 'Clinical correlation recommended, monitor symptoms, repeat imaging if concerns arise',
-                'monitoring': 'routine health check-ups, watch for new symptoms if they develop',
-                'follow_up': 'annual wellness visits, chest X-ray only if symptoms appear, maintain healthy lifestyle'
-            }
-        }
-        
-        context = class_context.get(predicted_class, class_context['Normal'])
+        # Get class-specific context
+        context = get_class_context(predicted_class)
         
         # Select tier-specific actions
-        if confidence_tier == "very_high":
-            tier_actions = context.get('actions_very_high', context.get('primary_actions', ''))
-        elif confidence_tier == "high":
-            tier_actions = context.get('actions_high', context.get('primary_actions', ''))
-        elif confidence_tier == "moderate":
-            tier_actions = context.get('actions_moderate', context.get('primary_actions', ''))
-        else:
-            tier_actions = context.get('actions_low', context.get('primary_actions', ''))
+        tier_actions = get_tier_actions(context, confidence_tier)
         
-        if confidence_tier in ["very_high", "high"]:
-            explanation_style = "minimal"
-        elif confidence_tier == "moderate":
-            explanation_style = "mixed"
-        else:
-            explanation_style = "moderate"
+        # Determine explanation style
+        explanation_style = get_explanation_style(confidence_tier)
         
+        # Terminology variants
         terminology_variants = {
             'ggo_terms': ['Bilat. ground-glass opacities', 'GGOs present bilaterally', 'Hazy infiltrates both lungs', 
                          'Ground-glass changes evident', 'Patchy opacities observed', 'Diffuse GGO pattern'],
@@ -206,7 +224,139 @@ def generate_medical_report(predicted_class, confidence, all_probabilities, requ
             'lungs': terminology_variants['both_lungs'][variation_seed % len(terminology_variants['both_lungs'])]
         }
         
-        prompt = f"""You are a radiologist writing quick clinical notes. Write naturally like a real doctor - not too polished, mix of formal/casual language.
+        # Build prompt
+        prompt = build_report_prompt(
+            predicted_class, confidence, confidence_descriptor, confidence_tier,
+            variation_seed, context, tier_actions, num_findings, num_recommendations,
+            explanation_style, selected_variants
+        )
+        
+        # Call Groq API
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"You are a radiologist. Use medical terminology and patient-friendly language.\nReport ID: {variation_seed} | Tier: {confidence_tier}"
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.65,
+            max_tokens=320,
+            top_p=0.9,
+            presence_penalty=0.5,
+            frequency_penalty=0.4
+        )
+        
+        report_text = chat_completion.choices[0].message.content.strip()
+        print(f"\n=== RAW REPORT FROM GROQ ===\n{report_text}\n=== END RAW REPORT ===\n")
+        
+        # Clean and parse report
+        clinical_text, recommendations_text = parse_report(
+            report_text, predicted_class, confidence, confidence_tier,
+            num_findings, num_recommendations
+        )
+            
+        return {
+            'clinical_interpretation': clinical_text,
+            'recommendations': recommendations_text
+        }
+
+    except Exception as e:
+        print(f"Groq API Error: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        confidence_tier = get_confidence_tier(confidence)
+        return {
+            'clinical_interpretation': get_fallback_clinical(predicted_class, confidence),
+            'recommendations': get_fallback_recommendations(predicted_class, confidence_tier)
+        }
+
+def get_confidence_tier(confidence):
+    """Determine confidence tier based on score"""
+    if confidence >= 0.90:
+        return "very_high"
+    elif confidence >= 0.75:
+        return "high"
+    elif confidence >= 0.60:
+        return "moderate"
+    else:
+        return "low"
+
+def get_class_context(predicted_class):
+    """Get medical context for each class"""
+    class_context = {
+        'COVID': {
+            'radiographic_findings': 'bilateral ground-glass opacities, peripheral distribution, typical COVID-19 pneumonia pattern',
+            'clinical_significance': 'viral infection affecting both lungs, respiratory system involvement, contagious disease',
+            'patient_explanation': 'cloudy patches in both lungs showing viral infection pattern typical of COVID-19',
+            'actions_very_high': 'Immediate RT-PCR/COVID test required, strict home isolation mandatory, continuous oxygen monitoring, antiviral therapy initiation, public health notification',
+            'actions_high': 'RT-PCR/COVID test recommended, home isolation advised, regular oxygen monitoring, consider antiviral therapy, standard follow-up',
+            'actions_moderate': 'Consider RT-PCR testing, home precautions suggested, monitor symptoms, clinical correlation needed, conservative management',
+            'actions_low': 'Clinical correlation essential, consider testing if symptoms worsen, observe closely, repeat imaging recommended, differential diagnosis needed',
+            'monitoring': 'oxygen saturation, breathing difficulty, fever progression',
+            'follow_up': 'chest X-ray in 5-7 days, telehealth check-ins, emergency if breathing worsens'
+        },
+        'Viral Pneumonia': {
+            'radiographic_findings': 'bilateral interstitial infiltrates, diffuse pulmonary involvement, viral pneumonia pattern',
+            'clinical_significance': 'non-COVID viral lung infection, inflammatory response in airways, respiratory compromise',
+            'patient_explanation': 'widespread inflammation in both lungs caused by a viral infection (not COVID-19)',
+            'actions_very_high': 'Comprehensive viral panel testing urgent, respiratory isolation mandatory, oxygen therapy if needed, broad antiviral coverage, intensive monitoring',
+            'actions_high': 'Viral panel testing recommended, respiratory precautions advised, supportive care, symptom management, regular monitoring',
+            'actions_moderate': 'Consider viral testing, supportive measures, rest and hydration, monitor progression, clinical correlation',
+            'actions_low': 'Clinical assessment needed, observe symptoms, consider testing if worsening, supportive care, differential workup',
+            'monitoring': 'temperature, breathing pattern, energy levels, cough progression',
+            'follow_up': 'follow-up imaging in 10 days, symptom diary, gradual activity increase'
+        },
+        'Lung_Opacity': {
+            'radiographic_findings': 'pulmonary opacity present, localized or diffuse density, etiology unclear',
+            'clinical_significance': 'abnormal area in lung tissue, requires further investigation, could indicate infection or inflammation',
+            'patient_explanation': 'unclear cloudy area in the lungs that needs more tests to understand the cause',
+            'actions_very_high': 'Urgent CT scan required, comprehensive blood work, immediate pulmonology consult, rule out serious pathology, expedited workup',
+            'actions_high': 'CT scan recommended for characterization, blood work advised, pulmonology referral, thorough investigation needed',
+            'actions_moderate': 'Consider CT for detail, basic labs, clinical correlation, monitor progression, conservative approach',
+            'actions_low': 'Observe closely, consider repeat imaging, clinical assessment, may be benign finding, watchful waiting',
+            'monitoring': 'new symptoms, breathing changes, chest discomfort, cough development',
+            'follow_up': 'repeat chest X-ray in 2-4 weeks, track symptoms daily, specialist referral if needed'
+        },
+        'Normal': {
+            'radiographic_findings': 'clear bilateral lung fields, normal cardiopulmonary silhouette, no acute abnormalities',
+            'clinical_significance': 'no evidence of infection, inflammation, or structural abnormality, healthy lung appearance',
+            'patient_explanation': 'lungs appear healthy and clear with no signs of infection or disease',
+            'actions_very_high': 'No intervention required, routine health maintenance, continue normal activities, annual check-ups',
+            'actions_high': 'No immediate treatment needed, routine preventive care, standard follow-up schedule',
+            'actions_moderate': 'Likely no intervention needed, observe if symptoms present, routine care advised',
+            'actions_low': 'Clinical correlation recommended, monitor symptoms, repeat imaging if concerns arise',
+            'monitoring': 'routine health check-ups, watch for new symptoms if they develop',
+            'follow_up': 'annual wellness visits, chest X-ray only if symptoms appear, maintain healthy lifestyle'
+        }
+    }
+    return class_context.get(predicted_class, class_context['Normal'])
+
+def get_tier_actions(context, confidence_tier):
+    """Get tier-specific actions"""
+    actions_key = f'actions_{confidence_tier}'
+    return context.get(actions_key, context.get('actions_high', ''))
+
+def get_explanation_style(confidence_tier):
+    """Determine explanation style based on confidence tier"""
+    if confidence_tier in ["very_high", "high"]:
+        return "minimal"
+    elif confidence_tier == "moderate":
+        return "mixed"
+    else:
+        return "moderate"
+
+def build_report_prompt(predicted_class, confidence, confidence_descriptor, 
+                       confidence_tier, variation_seed, context, tier_actions,
+                       num_findings, num_recommendations, explanation_style, 
+                       selected_variants):
+    """Build the prompt for Groq API"""
+    return f"""You are a radiologist writing quick clinical notes. Write naturally like a real doctor - not too polished, mix of formal/casual language.
 
 DIAGNOSIS: {predicted_class}
 CONFIDENCE: {confidence*100:.1f}% ({confidence_descriptor})
@@ -248,83 +398,51 @@ Write EXACTLY {num_recommendations} action items. Be practical and direct:
 
 Format with bullets (•), no headers, blank line between sections."""
 
-        chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"""You are a radiologist. Use medical terminology and patient-friendly language.
-Report ID: {variation_seed} | Tier: {confidence_tier}"""
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.65,
-            max_tokens=320,
-            top_p=0.9,
-            presence_penalty=0.5,
-            frequency_penalty=0.4
-        )
+def parse_report(report_text, predicted_class, confidence, confidence_tier,
+                num_findings, num_recommendations):
+    """Parse and clean the Groq report response"""
+    # Clean unwanted text
+    report_text = re.sub(r'\*\*', '', report_text)
+    report_text = re.sub(r'(?i)(WHAT WE FOUND.*?:?\s*)', '', report_text)
+    report_text = re.sub(r'(?i)(WHAT YOU SHOULD DO.*?:?\s*)', '', report_text)
+    report_text = re.sub(r'(?i)(CLINICAL.*?:?\s*)', '', report_text)
+    report_text = re.sub(r'(?i)(RECOMMENDATIONS?.*?:?\s*)', '', report_text)
+    report_text = re.sub(r'([a-z])([A-Z])', r'\1 \2', report_text)
+    report_text = re.sub(r'(\w)(needed|required|recommended)', r'\1 \2', report_text)
+    
+    sections_split = re.split(r'\n\s*\n+', report_text.strip())
+    
+    clinical_text = ''
+    recommendations_text = ''
+    
+    if len(sections_split) >= 2:
+        clinical_text = sections_split[0].strip()
+        recommendations_text = sections_split[1].strip()
+    else:
+        all_lines = [l.strip() for l in report_text.split('\n') if l.strip()]
+        bullets = [l for l in all_lines if l.startswith('•') or l.startswith('-')]
         
-        report_text = chat_completion.choices[0].message.content.strip()
-        print(f"\n=== RAW REPORT FROM GROQ ===\n{report_text}\n=== END RAW REPORT ===\n")
-        
-        # Clean unwanted text
-        report_text = re.sub(r'\*\*', '', report_text)
-        report_text = re.sub(r'(?i)(WHAT WE FOUND.*?:?\s*)', '', report_text)
-        report_text = re.sub(r'(?i)(WHAT YOU SHOULD DO.*?:?\s*)', '', report_text)
-        report_text = re.sub(r'(?i)(CLINICAL.*?:?\s*)', '', report_text)
-        report_text = re.sub(r'(?i)(RECOMMENDATIONS?.*?:?\s*)', '', report_text)
-        report_text = re.sub(r'([a-z])([A-Z])', r'\1 \2', report_text)
-        report_text = re.sub(r'(\w)(needed|required|recommended)', r'\1 \2', report_text)
-        
-        sections_split = re.split(r'\n\s*\n+', report_text.strip())
-        
-        clinical_text = ''
-        recommendations_text = ''
-        
-        if len(sections_split) >= 2:
-            clinical_text = sections_split[0].strip()
-            recommendations_text = sections_split[1].strip()
+        if len(bullets) >= (num_findings + num_recommendations):
+            clinical_text = '\n'.join(bullets[:num_findings])
+            recommendations_text = '\n'.join(bullets[num_findings:num_findings+num_recommendations])
+        elif len(bullets) >= num_findings:
+            clinical_text = '\n'.join(bullets[:num_findings])
+            recommendations_text = '\n'.join(bullets[num_findings:])
         else:
-            all_lines = [l.strip() for l in report_text.split('\n') if l.strip()]
-            bullets = [l for l in all_lines if l.startswith('•') or l.startswith('-')]
-            
-            if len(bullets) >= (num_findings + num_recommendations):
-                clinical_text = '\n'.join(bullets[:num_findings])
-                recommendations_text = '\n'.join(bullets[num_findings:num_findings+num_recommendations])
-            elif len(bullets) >= num_findings:
-                clinical_text = '\n'.join(bullets[:num_findings])
-                recommendations_text = '\n'.join(bullets[num_findings:])
-            else:
-                return {
-                    'clinical_interpretation': get_fallback_clinical(predicted_class, confidence),
-                    'recommendations': get_fallback_recommendations(predicted_class, confidence_tier)
-                }
+            return (
+                get_fallback_clinical(predicted_class, confidence),
+                get_fallback_recommendations(predicted_class, confidence_tier)
+            )
+    
+    if not clinical_text or len(clinical_text) < 20:
+        clinical_text = get_fallback_clinical(predicted_class, confidence)
+    if not recommendations_text or len(recommendations_text) < 20:
+        recommendations_text = get_fallback_recommendations(predicted_class, confidence_tier)
         
-        if not clinical_text or len(clinical_text) < 20:
-            clinical_text = get_fallback_clinical(predicted_class, confidence)
-        if not recommendations_text or len(recommendations_text) < 20:
-            recommendations_text = get_fallback_recommendations(predicted_class, confidence_tier)
-            
-        return {
-            'clinical_interpretation': clinical_text,
-            'recommendations': recommendations_text
-        }
-
-    except Exception as e:
-        print(f"Groq API Error: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        return {
-            'clinical_interpretation': get_fallback_clinical(predicted_class, confidence),
-            'recommendations': get_fallback_recommendations(predicted_class, confidence_tier if 'confidence_tier' in locals() else 'high')
-        }
+    return clinical_text, recommendations_text
 
 def get_fallback_clinical(predicted_class, confidence):
+    """Fallback clinical interpretations"""
     interpretations = {
         'COVID': '''• Bilateral ground-glass opacities (cloudy patches both lungs)
 • Peripheral distribution pattern consistent with COVID-19
@@ -349,6 +467,7 @@ def get_fallback_clinical(predicted_class, confidence):
     return interpretations.get(predicted_class, interpretations['Normal'])
 
 def get_fallback_recommendations(predicted_class, confidence_tier="high"):
+    """Fallback recommendations based on diagnosis and confidence"""
     recommendations = {
         'COVID': {
             'very_high': '''• Immediate RT-PCR test required for COVID-19 confirmation
@@ -453,8 +572,43 @@ def load_model(model_type):
     
     model_path = MODEL_PATHS[model_type]
     
+    # If the model file is not present locally, try to download from Hugging Face repo
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
+        try:
+            def download_model_from_hf(filename):
+                repo_id = HUGGINGFACE_REPO
+                token = HUGGINGFACE_TOKEN
+                # Try the exact filename in the repo, and also under best_models/
+                candidates = [filename, os.path.join('best_models', filename)]
+                last_err = None
+                for candidate in candidates:
+                    try:
+                        print(f"Attempting to download '{candidate}' from HF repo '{repo_id}'")
+                        cached_file = hf_hub_download(repo_id=repo_id, filename=candidate, token=token)
+                        print(f"Downloaded model to cache: {cached_file}")
+
+                        # Ensure local best_models folder exists
+                        target_path = filename if os.path.dirname(filename) else os.path.join('best_models', filename)
+                        os.makedirs(os.path.dirname(target_path) or '.', exist_ok=True)
+
+                        # Copy cached file to repository-local path so the server has a stable copy
+                        try:
+                            shutil.copy(cached_file, target_path)
+                            print(f"Copied model to local path: {target_path}")
+                            return target_path
+                        except Exception as e:
+                            print(f"Failed to copy cached model to {target_path}: {e}")
+                            # Fallback to returning the cached path
+                            return cached_file
+                    except Exception as e:
+                        print(f"Could not download '{candidate}': {e}")
+                        last_err = e
+                raise FileNotFoundError(f"Could not find '{filename}' in HF repo '{repo_id}': {last_err}")
+
+            print(f"Model file '{model_path}' not found locally. Trying Hugging Face repo...")
+            model_path = download_model_from_hf(model_path)
+        except Exception as e:
+            raise FileNotFoundError(f"Model file not found locally and HF download failed: {e}")
     
     # Build the appropriate model architecture
     if model_type == "ResNet18":
@@ -467,7 +621,18 @@ def load_model(model_type):
         raise ValueError(f"Unknown model type: {model_type}")
     
     # Load weights
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    # Note: remove unsupported kwargs when using torch.load
+    state = torch.load(model_path, map_location=DEVICE)
+    # If the saved object is a state_dict, load it. Otherwise, try to load model directly.
+    if isinstance(state, dict):
+        model.load_state_dict(state)
+    else:
+        # If a full model was saved, attempt to load state_dict attribute or assign directly
+        try:
+            model.load_state_dict(state.state_dict())
+        except Exception:
+            # As a last resort, replace model object
+            model = state
     model = model.to(DEVICE)
     model.eval()
     
@@ -477,28 +642,21 @@ def load_model(model_type):
     
     return model
 
-# Preload VGG19 at startup (most commonly used)
+# Prefetch models (Render-friendly) and preload VGG19 at startup (most commonly used)
+try:
+    predownload_all_models()
+except Exception as e:
+    print(f"Warning: predownload_all_models failed: {e}")
+
 try:
     print("Preloading VGG19 model...")
     load_model("VGG19")
 except Exception as e:
     print(f"WARNING: Failed to preload VGG19: {e}")
 
-# =============================================================
-#                   API ENDPOINTS
-# =============================================================
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'loaded_models': list(loaded_models.keys()),
-        'available_models': list(MODEL_PATHS.keys()),
-        'device': str(DEVICE)
-    })
-
 @app.route('/predict', methods=['POST'])
 def predict():
+    """Prediction endpoint"""
     global request_counter
     request_counter += 1
     current_request_id = request_counter
@@ -543,7 +701,12 @@ def predict():
         all_probabilities = {CLASS_NAMES[i]: float(probabilities[0][i].item()) for i in range(NUM_CLASSES)}
 
         # Generate medical report
-        medical_report = generate_medical_report(predicted_label, confidence_score, all_probabilities, current_request_id)
+        medical_report = generate_medical_report(
+            predicted_label, 
+            confidence_score, 
+            all_probabilities, 
+            current_request_id
+        )
 
         result = {
             'predicted_class': predicted_label,
@@ -574,8 +737,10 @@ if __name__ == '__main__':
     print(f"Available Models: {list(MODEL_PATHS.keys())}")
     print(f"Device: {DEVICE}")
     print(f"Classes: {CLASS_NAMES}")
+    print(f"Python: {os.sys.version}")
+    print(f"PyTorch: {torch.__version__}")
     print("=" * 70)
-    print("\nServer running on http://localhost:5000")
+    print(f"\nServer running on http://0.0.0.0:{PORT}")
     print("Press CTRL+C to stop\n")
     
     app.run(host='0.0.0.0', port=PORT, debug=False)
