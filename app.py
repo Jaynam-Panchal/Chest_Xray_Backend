@@ -9,7 +9,7 @@ import io
 import time
 import os
 import re
-from groq import Groq
+from groq import Client
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -49,7 +49,7 @@ TEMPERATURE = 5.0
 print(f"Using device: {DEVICE}")
 
 # Initialize Groq client
-groq_client = Groq(api_key=GROQ_API_KEY)
+groq_client = Client(api_key=GROQ_API_KEY)
 
 # Store loaded models in memory
 loaded_models = {}
