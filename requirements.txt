@@ -7,3 +7,4 @@ pillow==10.1.0
 groq==0.4.1
 python-dotenv==1.0.0
 gunicorn==21.2.0
+huggingface-hub==0.20.0
