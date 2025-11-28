@@ -4,6 +4,6 @@ torch==2.9.1
 torchvision==0.24.1
 timm==0.9.12
 pillow==11.0.0
-groq==0.4.1
+groq==0.3.0
 python-dotenv==1.0.0
 gunicorn==21.2.0
