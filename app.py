@@ -10,31 +10,26 @@ import time
 import os
 import re
 from groq import Groq
-from dotenv import load_dotenv
 from huggingface_hub import hf_hub_download
-import hashlib
-
-load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
 request_counter = 0
 
-# ============ CONFIGURATION FOR RENDER ============
-# Hugging Face Repository
-HF_REPO_ID = os.getenv("HF_REPO_ID", "jainam1510/Chest_Xray_model")  # CHANGE THIS!
-HF_TOKEN = os.getenv("HF_TOKEN")  # Optional, only if repo is private
+# ============ CONFIGURATION ============
+# IMPORTANT: Replace these with your actual values
+YOUR_HF_USERNAME = "jainam1510"  # Your Hugging Face username
+YOUR_MODEL_REPO = "Chest_Xray_model"  # Your model repository name
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # Set this in HF Spaces settings
 
-# Model filenames in your HF repo
+# Define model filenames as they appear in your HF repo
 MODEL_FILES = {
-    "VGG19": "OVERALL_BEST_VGG19_lr0.005_weight_decay0.0001_batch_size32_optimizersgd.pth",
-    "ResNet18": "BEST_ResNet18_lr0.01_weight_decay0.0001_batch_size32_optimizersgd.pth",
-    "ViT_Small": "BEST_ViT_Small_lr0.0001_weight_decay0.05_batch_size32_optimizeradamw.pth"
+    "VGG19": "best_models/OVERALL_BEST_VGG19_lr0.005_weight_decay0.0001_batch_size32_optimizersgd.pth",
+    "ResNet18": "best_models/BEST_ResNet18_lr0.01_weight_decay0.0001_batch_size32_optimizersgd.pth",
+    "ViT_Small": "best_models/BEST_ViT_Small_lr0.0001_weight_decay0.05_batch_size32_optimizeradamw.pth"
 }
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# ==================================================
+# =======================================
 
 NUM_CLASSES = 4
 CLASS_NAMES = ['COVID', 'Lung_Opacity', 'Normal', 'Viral Pneumonia']
@@ -49,6 +44,7 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 
 # Store loaded models in memory
 loaded_models = {}
+model_local_paths = {}
 
 # Image transformation
 transform = transforms.Compose([
@@ -78,7 +74,7 @@ def get_vit_small(num_classes):
     return model
 
 # =============================================================
-#         MEDICAL REPORT GENERATION USING GROQ
+#         MEDICAL REPORT GENERATION (Same as before)
 # =============================================================
 
 def generate_medical_report(predicted_class, confidence, all_probabilities, request_id=0):
@@ -87,7 +83,6 @@ def generate_medical_report(predicted_class, confidence, all_probabilities, requ
         
         probs_text = ", ".join([f"{name}: {prob*100:.1f}%" for name, prob in sorted(all_probabilities.items(), key=lambda x: x[1], reverse=True)])
         
-        # Confidence Tier System
         if confidence >= 0.90:
             confidence_tier = "very_high"
             confidence_descriptor = "high confidence, clear and definitive findings"
@@ -113,12 +108,12 @@ def generate_medical_report(predicted_class, confidence, all_probabilities, requ
             num_findings = 3
             num_recommendations = 4
         
+        import hashlib
         confidence_bucket = f"{confidence:.4f}"
         variation_string = f"{predicted_class}_{confidence_bucket}_{request_id}_{int(time.time() * 1000) % 10000}"
         variation_seed = int(hashlib.md5(variation_string.encode()).hexdigest()[:8], 16) % 10000
         random.seed(variation_seed)
         
-        # Detailed, label-specific medical context
         class_context = {
             'COVID': {
                 'radiographic_findings': 'bilateral ground-glass opacities, peripheral distribution, typical COVID-19 pneumonia pattern',
@@ -168,7 +163,6 @@ def generate_medical_report(predicted_class, confidence, all_probabilities, requ
         
         context = class_context.get(predicted_class, class_context['Normal'])
         
-        # Select tier-specific actions
         if confidence_tier == "very_high":
             tier_actions = context.get('actions_very_high', context.get('primary_actions', ''))
         elif confidence_tier == "high":
@@ -265,7 +259,6 @@ Report ID: {variation_seed} | Tier: {confidence_tier}"""
         
         report_text = chat_completion.choices[0].message.content.strip()
         
-        # Clean unwanted text
         report_text = re.sub(r'\*\*', '', report_text)
         report_text = re.sub(r'(?i)(WHAT WE FOUND.*?:?\s*)', '', report_text)
         report_text = re.sub(r'(?i)(WHAT YOU SHOULD DO.*?:?\s*)', '', report_text)
@@ -436,22 +429,22 @@ def get_fallback_recommendations(predicted_class, confidence_tier="high"):
 
 def download_model_from_hf(model_type):
     """Download model from Hugging Face Hub"""
+    if model_type in model_local_paths:
+        return model_local_paths[model_type]
+    
+    print(f"Downloading {model_type} from Hugging Face...")
+    
     try:
-        filename = MODEL_FILES[model_type]
-        print(f"Downloading {model_type} from Hugging Face...")
-        
-        model_path = hf_hub_download(
-            repo_id=HF_REPO_ID,
-            filename=filename,
-            token=HF_TOKEN,
-            cache_dir="./model_cache"  # Cache models to avoid re-downloading
+        local_path = hf_hub_download(
+            repo_id=f"{YOUR_HF_USERNAME}/{YOUR_MODEL_REPO}",
+            filename=MODEL_FILES[model_type],
+            repo_type="model"
         )
-        
-        print(f"Model downloaded to: {model_path}")
-        return model_path
-        
+        model_local_paths[model_type] = local_path
+        print(f"Downloaded {model_type} to {local_path}")
+        return local_path
     except Exception as e:
-        print(f"Error downloading model from HF: {e}")
+        print(f"Error downloading {model_type}: {e}")
         raise
 
 def load_model(model_type):
@@ -465,11 +458,8 @@ def load_model(model_type):
     if model_type not in MODEL_FILES:
         raise ValueError(f"Unknown model type: {model_type}")
     
-    # Download model from Hugging Face
-    try:
-        model_path = download_model_from_hf(model_type)
-    except Exception as e:
-        raise FileNotFoundError(f"Failed to download model: {e}")
+    # Download from HF if not already downloaded
+    model_path = download_model_from_hf(model_type)
     
     # Build the appropriate model architecture
     if model_type == "ResNet18":
@@ -482,7 +472,7 @@ def load_model(model_type):
         raise ValueError(f"Unknown model type: {model_type}")
     
     # Load weights
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model = model.to(DEVICE)
     model.eval()
     
@@ -492,13 +482,12 @@ def load_model(model_type):
     
     return model
 
-# Preload VGG19 at startup (most commonly used)
+# Preload VGG19 at startup
 try:
     print("Preloading VGG19 model...")
     load_model("VGG19")
 except Exception as e:
     print(f"WARNING: Failed to preload VGG19: {e}")
-    print("Model will be loaded on first request")
 
 # =============================================================
 #                   API ENDPOINTS
@@ -510,8 +499,7 @@ def health_check():
         'status': 'healthy',
         'loaded_models': list(loaded_models.keys()),
         'available_models': list(MODEL_FILES.keys()),
-        'device': str(DEVICE),
-        'hf_repo': HF_REPO_ID
+        'device': str(DEVICE)
     })
 
 @app.route('/predict', methods=['POST'])
@@ -528,26 +516,22 @@ def predict():
         if file.filename == '':
             return jsonify({'error': 'No file selected'}), 400
         
-        # Get model type from request (default to VGG19)
         model_type = request.form.get('model', 'VGG19')
         
         if model_type not in MODEL_FILES:
             return jsonify({'error': f'Invalid model type: {model_type}'}), 400
         
-        # Load the requested model
         try:
             model = load_model(model_type)
         except Exception as e:
             return jsonify({'error': f'Failed to load model: {str(e)}'}), 500
 
-        # Read and preprocess image
         image_bytes = file.read()
         image = Image.open(io.BytesIO(image_bytes))
         if image.mode != 'RGB':
             image = image.convert('RGB')
         image_tensor = transform(image).unsqueeze(0).to(DEVICE)
 
-        # Prediction
         start_time = time.time()
         with torch.no_grad():
             outputs = model(image_tensor)
@@ -559,7 +543,6 @@ def predict():
         confidence_score = confidence.item()
         all_probabilities = {CLASS_NAMES[i]: float(probabilities[0][i].item()) for i in range(NUM_CLASSES)}
 
-        # Generate medical report
         medical_report = generate_medical_report(predicted_label, confidence_score, all_probabilities, current_request_id)
 
         result = {
@@ -580,19 +563,14 @@ def predict():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-# =============================================================
-#                      SERVER START
-# =============================================================
-
 if __name__ == '__main__':
     print("=" * 70)
-    print("COVID-19 X-RAY CLASSIFICATION SERVER")
+    print("COVID-19 X-RAY CLASSIFICATION SERVER (HF SPACES)")
     print("=" * 70)
+    print(f"HF Repo: {YOUR_HF_USERNAME}/{YOUR_MODEL_REPO}")
     print(f"Available Models: {list(MODEL_FILES.keys())}")
-    print(f"HF Repository: {HF_REPO_ID}")
     print(f"Device: {DEVICE}")
     print(f"Classes: {CLASS_NAMES}")
     print("=" * 70)
-    print("\nServer ready!")
     
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=7860, debug=False)  # HF Spaces uses port 7860
